@@ -27,6 +27,154 @@ let buildDate: String = {
 }()
 let supportedExtensions: Set<String> = ["png", "jpg", "jpeg", "heic"]
 
+// MARK: - Launchd Service Management
+
+let serviceLabel = Bundle.main.bundleIdentifier ?? "tw.mingtsay.app.macos.VisionApiServer"
+
+func executablePath() -> String {
+    // Resolve the real path of the current executable
+    let path = CommandLine.arguments.first ?? ProcessInfo.processInfo.arguments.first ?? "vision-api-server"
+    return URL(fileURLWithPath: path).standardizedFileURL.path
+}
+
+func generatePlist(host: String, port: UInt16) -> String {
+    let execPath = executablePath()
+    return """
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0">
+    <dict>
+        <key>Label</key>
+        <string>\(serviceLabel)</string>
+        <key>ProgramArguments</key>
+        <array>
+            <string>\(execPath)</string>
+            <string>--host</string>
+            <string>\(host)</string>
+            <string>--port</string>
+            <string>\(port)</string>
+        </array>
+        <key>RunAtLoad</key>
+        <true/>
+        <key>KeepAlive</key>
+        <true/>
+        <key>StandardOutPath</key>
+        <string>/tmp/vision-api-server.log</string>
+        <key>StandardErrorPath</key>
+        <string>/tmp/vision-api-server.err</string>
+    </dict>
+    </plist>
+    """
+}
+
+enum ServiceScope {
+    case system  // /Library/LaunchDaemons (requires root)
+    case user    // ~/Library/LaunchAgents
+
+    var plistPath: String {
+        switch self {
+        case .system:
+            return "/Library/LaunchDaemons/\(serviceLabel).plist"
+        case .user:
+            let home = FileManager.default.homeDirectoryForCurrentUser.path
+            return "\(home)/Library/LaunchAgents/\(serviceLabel).plist"
+        }
+    }
+
+    var displayName: String {
+        switch self {
+        case .system: return "system"
+        case .user: return "user"
+        }
+    }
+
+    var domain: String {
+        switch self {
+        case .system: return "system"
+        case .user: return "gui/\(getuid())"
+        }
+    }
+}
+
+func installService(scope: ServiceScope, host: String, port: UInt16) {
+    let plistPath = scope.plistPath
+    let plistDir = (plistPath as NSString).deletingLastPathComponent
+
+    // Ensure directory exists for user scope
+    if scope == .user {
+        try? FileManager.default.createDirectory(atPath: plistDir, withIntermediateDirectories: true)
+    }
+
+    let plist = generatePlist(host: host, port: port)
+    do {
+        try plist.write(toFile: plistPath, atomically: true, encoding: .utf8)
+    } catch {
+        fputs("Error: failed to write plist to \(plistPath): \(error.localizedDescription)\n", stderr)
+        if scope == .system {
+            fputs("Hint: system scope requires sudo.\n", stderr)
+        }
+        exit(1)
+    }
+
+    // Bootstrap the service
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+    process.arguments = ["bootstrap", scope.domain, plistPath]
+    do {
+        try process.run()
+        process.waitUntilExit()
+    } catch {
+        fputs("Error: failed to run launchctl: \(error.localizedDescription)\n", stderr)
+        exit(1)
+    }
+
+    if process.terminationStatus == 0 {
+        print("Installed and started \(scope.displayName) service.")
+        print("  Plist: \(plistPath)")
+        print("  Binary: \(executablePath())")
+        print("  Listen: \(formatListenAddress(host: host, port: port))")
+        print("  Logs: /tmp/vision-api-server.log")
+    } else {
+        // Service may already be loaded — try kickstart instead
+        fputs("Warning: bootstrap returned \(process.terminationStatus) (service may already be loaded).\n", stderr)
+        fputs("Try: launchctl kickstart -k \(scope.domain)/\(serviceLabel)\n", stderr)
+        exit(1)
+    }
+    exit(0)
+}
+
+func uninstallService(scope: ServiceScope) {
+    let plistPath = scope.plistPath
+
+    // Bootout the service
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+    process.arguments = ["bootout", "\(scope.domain)/\(serviceLabel)"]
+    do {
+        try process.run()
+        process.waitUntilExit()
+    } catch {
+        fputs("Error: failed to run launchctl: \(error.localizedDescription)\n", stderr)
+    }
+
+    // Remove plist
+    if FileManager.default.fileExists(atPath: plistPath) {
+        do {
+            try FileManager.default.removeItem(atPath: plistPath)
+            print("Removed \(plistPath)")
+        } catch {
+            fputs("Error: failed to remove plist: \(error.localizedDescription)\n", stderr)
+            if scope == .system {
+                fputs("Hint: system scope requires sudo.\n", stderr)
+            }
+            exit(1)
+        }
+    }
+
+    print("Uninstalled \(scope.displayName) service.")
+    exit(0)
+}
+
 // MARK: - CLI Arguments
 
 func printHelp() {
@@ -39,9 +187,15 @@ func printHelp() {
       \(name) [OPTIONS]
 
     OPTIONS:
-      -h, --host <addr>   Bind address (default: ::1)
-      -p, --port <port>   Listen port (default: 8765)
-      --help              Show this help message
+      -h, --host <addr>      Bind address (default: ::1)
+      -p, --port <port>      Listen port (default: 8765)
+      --help                 Show this help message
+
+    SERVICE MANAGEMENT:
+      --install              Install as system launchd service (requires sudo)
+      --uninstall            Uninstall system launchd service (requires sudo)
+      --install-user         Install as user launchd service
+      --uninstall-user       Uninstall user launchd service
 
     ENDPOINTS:
       GET  /health            Health check
@@ -53,9 +207,16 @@ func printHelp() {
     """)
 }
 
-func parseArgs() -> (host: String, port: UInt16) {
+enum Action {
+    case run
+    case install(ServiceScope)
+    case uninstall(ServiceScope)
+}
+
+func parseArgs() -> (action: Action, host: String, port: UInt16) {
     var host = "::1"
     var port: UInt16 = 8765
+    var action: Action = .run
     var args = CommandLine.arguments.dropFirst().makeIterator()
 
     while let arg = args.next() {
@@ -67,6 +228,14 @@ func parseArgs() -> (host: String, port: UInt16) {
             if let val = args.next() { host = val }
         case "-p", "--port":
             if let val = args.next(), let p = UInt16(val) { port = p }
+        case "--install":
+            action = .install(.system)
+        case "--uninstall":
+            action = .uninstall(.system)
+        case "--install-user":
+            action = .install(.user)
+        case "--uninstall-user":
+            action = .uninstall(.user)
         default:
             if arg.hasPrefix("--host=") {
                 host = String(arg.dropFirst("--host=".count))
@@ -75,12 +244,22 @@ func parseArgs() -> (host: String, port: UInt16) {
             }
         }
     }
-    return (host, port)
+    return (action, host, port)
 }
 
 // MARK: - HTTP Server
 
-let (host, port) = parseArgs()
+let (action, host, port) = parseArgs()
+
+// Handle install/uninstall before starting the server
+switch action {
+case .install(let scope):
+    installService(scope: scope, host: host, port: port)
+case .uninstall(let scope):
+    uninstallService(scope: scope)
+case .run:
+    break
+}
 
 func formatListenAddress(host: String, port: UInt16) -> String {
     if host.contains(":") {
@@ -104,6 +283,52 @@ func httpResponse(status: Int, statusText: String, body: Data) -> Data {
 
 func jsonResponse(status: Int, statusText: String, _ dict: [String: Any]) -> Data {
     httpResponse(status: status, statusText: statusText, body: jsonData(dict))
+}
+
+// MARK: - Request Counters
+
+let serverStartDate = Date()
+
+actor RequestCounters {
+    private(set) var totalRequests: Int = 0
+    private(set) var successCount: Int = 0
+    private(set) var errorCount: Int = 0
+    private(set) var activeRequests: Int = 0
+
+    func beginRequest() { totalRequests += 1; activeRequests += 1 }
+    func endSuccess() { successCount += 1; activeRequests -= 1 }
+    func endError() { errorCount += 1; activeRequests -= 1 }
+
+    func snapshot() -> [String: Int] {
+        [
+            "total_requests": totalRequests,
+            "success_count": successCount,
+            "error_count": errorCount,
+            "active_requests": activeRequests
+        ]
+    }
+}
+
+let counters = RequestCounters()
+
+// MARK: - System Info
+
+func memoryUsageMB() -> Double {
+    var info = mach_task_basic_info()
+    var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size) / 4
+    let result = withUnsafeMutablePointer(to: &info) {
+        $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+            task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
+        }
+    }
+    guard result == KERN_SUCCESS else { return -1 }
+    return Double(info.resident_size) / (1024 * 1024)
+}
+
+func systemLoadAverage() -> [Double] {
+    var loadavg = [Double](repeating: 0, count: 3)
+    getloadavg(&loadavg, 3)
+    return loadavg
 }
 
 // MARK: - Concurrency Control
@@ -290,7 +515,21 @@ func handleRequest(_ data: Data) async -> Data {
     let (method, path, body) = parseHTTPRequest(data)
 
     if method == "GET" && path == "/health" {
-        return jsonResponse(status: 200, statusText: "OK", ["status": "ok"])
+        let uptime = Date().timeIntervalSince(serverStartDate)
+        let load = systemLoadAverage()
+        let stats = await counters.snapshot()
+        let health: [String: Any] = [
+            "status": "ok",
+            "version": buildVersion,
+            "build_number": buildNumber,
+            "build_date": buildDate,
+            "uptime_seconds": Int(uptime),
+            "memory_mb": Double(round(memoryUsageMB() * 100) / 100),
+            "load_average": ["1m": load[0], "5m": load[1], "15m": load[2]],
+            "supported_formats": supportedExtensions.sorted(),
+            "counters": stats
+        ]
+        return jsonResponse(status: 200, statusText: "OK", health)
     }
 
     if method == "POST" && path == "/recognize" {
@@ -299,6 +538,7 @@ func handleRequest(_ data: Data) async -> Data {
             return jsonResponse(status: 400, statusText: "Bad Request", ["error": "invalid request body, expected JSON with 'path' or 'base64' field"])
         }
 
+        await counters.beginRequest()
         do {
             let result: [String: Any]
 
@@ -306,13 +546,16 @@ func handleRequest(_ data: Data) async -> Data {
                 result = try await recognizeText(at: filePath)
             } else if let base64String = json["base64"] as? String {
                 guard let imageData = Data(base64Encoded: base64String) else {
+                    await counters.endError()
                     return jsonResponse(status: 400, statusText: "Bad Request", ["error": "invalid base64 data"])
                 }
                 guard isValidImageData(imageData) else {
+                    await counters.endError()
                     return jsonResponse(status: 422, statusText: "Unprocessable Entity", ["error": "unsupported format"])
                 }
                 result = try await recognizeText(from: imageData)
             } else {
+                await counters.endError()
                 return jsonResponse(status: 400, statusText: "Bad Request", ["error": "expected 'path' or 'base64' field"])
             }
 
@@ -321,10 +564,13 @@ func handleRequest(_ data: Data) async -> Data {
                 var errorResult = result
                 errorResult.removeValue(forKey: "_status")
                 errorResult.removeValue(forKey: "_statusText")
+                await counters.endError()
                 return jsonResponse(status: status, statusText: statusText, errorResult)
             }
+            await counters.endSuccess()
             return jsonResponse(status: 200, statusText: "OK", result)
         } catch {
+            await counters.endError()
             return jsonResponse(status: 500, statusText: "Internal Server Error", ["error": error.localizedDescription])
         }
     }
@@ -339,10 +585,13 @@ func handleRequest(_ data: Data) async -> Data {
             return jsonResponse(status: 422, statusText: "Unprocessable Entity", ["error": "unsupported format"])
         }
 
+        await counters.beginRequest()
         do {
             let result = try await recognizeText(from: imageData)
+            await counters.endSuccess()
             return jsonResponse(status: 200, statusText: "OK", result)
         } catch {
+            await counters.endError()
             return jsonResponse(status: 500, statusText: "Internal Server Error", ["error": error.localizedDescription])
         }
     }
