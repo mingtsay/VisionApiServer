@@ -19,7 +19,7 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
-		6E781C8E2F8DD7A8000E23E2 /* VisionApiServer */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = VisionApiServer; sourceTree = BUILT_PRODUCTS_DIR; };
+		6E781C8E2F8DD7A8000E23E2 /* vision-api-server */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = "vision-api-server"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -52,7 +52,7 @@
 		6E781C8F2F8DD7A8000E23E2 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				6E781C8E2F8DD7A8000E23E2 /* VisionApiServer */,
+				6E781C8E2F8DD7A8000E23E2 /* vision-api-server */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -79,7 +79,7 @@
 			packageProductDependencies = (
 			);
 			productName = VisionApiServer;
-			productReference = 6E781C8E2F8DD7A8000E23E2 /* VisionApiServer */;
+			productReference = 6E781C8E2F8DD7A8000E23E2 /* vision-api-server */;
 			productType = "com.apple.product-type.tool";
 		};
 /* End PBXNativeTarget section */
@@ -253,7 +253,8 @@
 				CODE_SIGN_STYLE = Automatic;
 				DEVELOPMENT_TEAM = CYU9YTRLKN;
 				ENABLE_HARDENED_RUNTIME = YES;
-				PRODUCT_NAME = "$(TARGET_NAME)";
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				PRODUCT_NAME = "vision-api-server";
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
@@ -266,7 +267,8 @@
 				CODE_SIGN_STYLE = Automatic;
 				DEVELOPMENT_TEAM = CYU9YTRLKN;
 				ENABLE_HARDENED_RUNTIME = YES;
-				PRODUCT_NAME = "$(TARGET_NAME)";
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				PRODUCT_NAME = "vision-api-server";
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
