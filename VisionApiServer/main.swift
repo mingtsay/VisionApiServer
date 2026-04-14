@@ -32,9 +32,18 @@ let supportedExtensions: Set<String> = ["png", "jpg", "jpeg", "heic"]
 let serviceLabel = Bundle.main.bundleIdentifier ?? "tw.mingtsay.app.macos.VisionApiServer"
 
 func executablePath() -> String {
-    // Resolve the real path of the current executable
-    let path = CommandLine.arguments.first ?? ProcessInfo.processInfo.arguments.first ?? "vision-api-server"
-    return URL(fileURLWithPath: path).standardizedFileURL.path
+    // _NSGetExecutablePath gives the real path of the running binary
+    var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+    var size = UInt32(buffer.count)
+    if _NSGetExecutablePath(&buffer, &size) == 0,
+       let resolved = realpath(buffer, nil) {
+        let path = String(cString: resolved)
+        free(resolved)
+        return path
+    }
+    // Fallback: resolve argv[0] via PATH
+    let argv0 = CommandLine.arguments.first ?? "vision-api-server"
+    return URL(fileURLWithPath: argv0).standardizedFileURL.path
 }
 
 func generatePlist(host: String, port: UInt16) -> String {
