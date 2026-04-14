@@ -12,19 +12,22 @@ Primarily intended to be run as a local background service so other tools on the
 ## Build
 
 ```sh
-./build.sh
+./build.sh                 # build all three: arm64, x86_64, universal
+./build.sh arm64           # arm64 only
+./build.sh x86_64          # x86_64 only
+./build.sh universal       # universal (arm64 + x86_64)
 ```
 
-The binary is written to `build/Release/vision-api-server`.
+Binaries are written to:
+
+- `build/arm64/Release/vision-api-server`
+- `build/x86_64/Release/vision-api-server`
+- `build/universal/Release/vision-api-server`
 
 To override the version at build time (useful for CI/CD):
 
 ```sh
-# via environment variables
-MARKETING_VERSION=1.2.3 CURRENT_PROJECT_VERSION=42 ./build.sh
-
-# or positionally
-./build.sh 1.2.3 42
+MARKETING_VERSION=1.2.3 CURRENT_PROJECT_VERSION=42 ./build.sh universal
 ```
 
 `MARKETING_VERSION` maps to `CFBundleShortVersionString` and `CURRENT_PROJECT_VERSION` maps to `CFBundleVersion`. Both are embedded into the binary and exposed through `/health` and `--help`.
@@ -32,9 +35,9 @@ MARKETING_VERSION=1.2.3 CURRENT_PROJECT_VERSION=42 ./build.sh
 ## Run
 
 ```sh
-./build/Release/vision-api-server                      # defaults: ::1:8765
-./build/Release/vision-api-server --host 127.0.0.1 --port 9000
-./build/Release/vision-api-server --help
+./build/universal/Release/vision-api-server                      # defaults: ::1:8765
+./build/universal/Release/vision-api-server --host 127.0.0.1 --port 9000
+./build/universal/Release/vision-api-server --help
 ```
 
 | Option | Default | Description |
