@@ -1,705 +1,497 @@
-//
-//  main.swift
-//  VisionApiServer
-//
-//  Created by 蔡璨名 on 2026/4/14.
-//
-
 import Foundation
-import Vision
 import Network
+import Vision
+import CoreGraphics
+import ImageIO
 
-// MARK: - Build Info
+// MARK: - Version
 
-let buildVersion: String = {
-    Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown"
+let kVersion = "1.1.0"
+let kBuildDate: String = {
+    let df = DateFormatter()
+    df.dateFormat = "yyyy-MM-dd'T'HH:mm:ss'Z'"
+    df.timeZone = TimeZone(identifier: "UTC")
+    return df.string(from: Date())
 }()
-let buildNumber: String = {
-    Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? ""
+let kBuildNumber: String = {
+    let df = DateFormatter()
+    df.dateFormat = "yyMMddHH"
+    df.timeZone = TimeZone(identifier: "UTC")
+    return df.string(from: Date())
 }()
-let buildDate: String = {
-    if let execURL = Bundle.main.executableURL,
-       let attrs = try? FileManager.default.attributesOfItem(atPath: execURL.path),
-       let date = attrs[.modificationDate] as? Date {
-        return date.formatted(.iso8601)
-    }
-    return "unknown"
-}()
-let supportedExtensions: Set<String> = ["png", "jpg", "jpeg", "heic"]
-
-// MARK: - Launchd Service Management
-
-let serviceLabel = Bundle.main.bundleIdentifier ?? "tw.mingtsay.app.macos.VisionApiServer"
-
-func executablePath() -> String {
-    // _NSGetExecutablePath gives the real path of the running binary
-    var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
-    var size = UInt32(buffer.count)
-    if _NSGetExecutablePath(&buffer, &size) == 0,
-       let resolved = realpath(buffer, nil) {
-        let path = String(cString: resolved)
-        free(resolved)
-        return path
-    }
-    // Fallback: resolve argv[0] via PATH
-    let argv0 = CommandLine.arguments.first ?? "vision-api-server"
-    return URL(fileURLWithPath: argv0).standardizedFileURL.path
-}
-
-func generatePlist(host: String, port: UInt16) -> String {
-    let execPath = executablePath()
-    return """
-    <?xml version="1.0" encoding="UTF-8"?>
-    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-    <plist version="1.0">
-    <dict>
-        <key>Label</key>
-        <string>\(serviceLabel)</string>
-        <key>ProgramArguments</key>
-        <array>
-            <string>\(execPath)</string>
-            <string>--host</string>
-            <string>\(host)</string>
-            <string>--port</string>
-            <string>\(port)</string>
-        </array>
-        <key>RunAtLoad</key>
-        <true/>
-        <key>KeepAlive</key>
-        <true/>
-        <key>StandardOutPath</key>
-        <string>/tmp/vision-api-server.log</string>
-        <key>StandardErrorPath</key>
-        <string>/tmp/vision-api-server.err</string>
-    </dict>
-    </plist>
-    """
-}
-
-enum ServiceScope {
-    case system  // /Library/LaunchDaemons (requires root)
-    case user    // ~/Library/LaunchAgents
-
-    var plistPath: String {
-        switch self {
-        case .system:
-            return "/Library/LaunchDaemons/\(serviceLabel).plist"
-        case .user:
-            let home = FileManager.default.homeDirectoryForCurrentUser.path
-            return "\(home)/Library/LaunchAgents/\(serviceLabel).plist"
-        }
-    }
-
-    var displayName: String {
-        switch self {
-        case .system: return "system"
-        case .user: return "user"
-        }
-    }
-
-    var domain: String {
-        switch self {
-        case .system: return "system"
-        case .user: return "gui/\(getuid())"
-        }
-    }
-}
-
-func installService(scope: ServiceScope, host: String, port: UInt16) {
-    let plistPath = scope.plistPath
-    let plistDir = (plistPath as NSString).deletingLastPathComponent
-
-    // Ensure directory exists for user scope
-    if scope == .user {
-        try? FileManager.default.createDirectory(atPath: plistDir, withIntermediateDirectories: true)
-    }
-
-    let plist = generatePlist(host: host, port: port)
-    do {
-        try plist.write(toFile: plistPath, atomically: true, encoding: .utf8)
-    } catch {
-        fputs("Error: failed to write plist to \(plistPath): \(error.localizedDescription)\n", stderr)
-        if scope == .system {
-            fputs("Hint: system scope requires sudo.\n", stderr)
-        }
-        exit(1)
-    }
-
-    // Bootstrap the service
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-    process.arguments = ["bootstrap", scope.domain, plistPath]
-    do {
-        try process.run()
-        process.waitUntilExit()
-    } catch {
-        fputs("Error: failed to run launchctl: \(error.localizedDescription)\n", stderr)
-        exit(1)
-    }
-
-    if process.terminationStatus == 0 {
-        print("Installed and started \(scope.displayName) service.")
-        print("  Plist: \(plistPath)")
-        print("  Binary: \(executablePath())")
-        print("  Listen: \(formatListenAddress(host: host, port: port))")
-        print("  Logs: /tmp/vision-api-server.log")
-    } else {
-        // Service may already be loaded — try kickstart instead
-        fputs("Warning: bootstrap returned \(process.terminationStatus) (service may already be loaded).\n", stderr)
-        fputs("Try: launchctl kickstart -k \(scope.domain)/\(serviceLabel)\n", stderr)
-        exit(1)
-    }
-    exit(0)
-}
-
-func uninstallService(scope: ServiceScope) {
-    let plistPath = scope.plistPath
-
-    // Bootout the service
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-    process.arguments = ["bootout", "\(scope.domain)/\(serviceLabel)"]
-    do {
-        try process.run()
-        process.waitUntilExit()
-    } catch {
-        fputs("Error: failed to run launchctl: \(error.localizedDescription)\n", stderr)
-    }
-
-    // Remove plist
-    if FileManager.default.fileExists(atPath: plistPath) {
-        do {
-            try FileManager.default.removeItem(atPath: plistPath)
-            print("Removed \(plistPath)")
-        } catch {
-            fputs("Error: failed to remove plist: \(error.localizedDescription)\n", stderr)
-            if scope == .system {
-                fputs("Hint: system scope requires sudo.\n", stderr)
-            }
-            exit(1)
-        }
-    }
-
-    print("Uninstalled \(scope.displayName) service.")
-    exit(0)
-}
-
-// MARK: - CLI Arguments
-
-func printHelp() {
-    let name = (CommandLine.arguments.first as? NSString)?.lastPathComponent ?? "VisionApiServer"
-    print("""
-    \(name) v\(buildVersion)\(buildNumber.isEmpty ? "" : " (\(buildNumber))") (built \(buildDate))
-    Vision OCR HTTP API Server — macOS \(ProcessInfo.processInfo.operatingSystemVersionString)
-
-    USAGE:
-      \(name) [OPTIONS]
-
-    OPTIONS:
-      -h, --host <addr>      Bind address (default: ::1)
-      -p, --port <port>      Listen port (default: 8765)
-      --help                 Show this help message
-
-    SERVICE MANAGEMENT:
-      --install              Install as system launchd service (requires sudo)
-      --uninstall            Uninstall system launchd service (requires sudo)
-      --install-user         Install as user launchd service
-      --uninstall-user       Uninstall user launchd service
-
-    ENDPOINTS:
-      GET  /health            Health check
-      POST /recognize         JSON body: {"path": "/file"} or {"base64": "..."}
-      POST /recognize/raw     Raw image bytes as body
-
-    SUPPORTED FORMATS:
-      \(supportedExtensions.sorted().joined(separator: ", "))
-    """)
-}
-
-enum Action {
-    case run
-    case install(ServiceScope)
-    case uninstall(ServiceScope)
-}
-
-func parseArgs() -> (action: Action, host: String, port: UInt16) {
-    var host = "::1"
-    var port: UInt16 = 8765
-    var action: Action = .run
-    var args = CommandLine.arguments.dropFirst().makeIterator()
-
-    while let arg = args.next() {
-        switch arg {
-        case "--help":
-            printHelp()
-            exit(0)
-        case "-h", "--host":
-            if let val = args.next() { host = val }
-        case "-p", "--port":
-            if let val = args.next(), let p = UInt16(val) { port = p }
-        case "--install":
-            action = .install(.system)
-        case "--uninstall":
-            action = .uninstall(.system)
-        case "--install-user":
-            action = .install(.user)
-        case "--uninstall-user":
-            action = .uninstall(.user)
-        default:
-            if arg.hasPrefix("--host=") {
-                host = String(arg.dropFirst("--host=".count))
-            } else if arg.hasPrefix("--port="), let p = UInt16(arg.dropFirst("--port=".count)) {
-                port = p
-            }
-        }
-    }
-    return (action, host, port)
-}
-
-// MARK: - HTTP Server
-
-let (action, host, port) = parseArgs()
-
-// Handle install/uninstall before starting the server
-switch action {
-case .install(let scope):
-    installService(scope: scope, host: host, port: port)
-case .uninstall(let scope):
-    uninstallService(scope: scope)
-case .run:
-    break
-}
-
-func formatListenAddress(host: String, port: UInt16) -> String {
-    if host.contains(":") {
-        return "http://[\(host)]:\(port)"
-    }
-    return "http://\(host):\(port)"
-}
-
-func jsonData(_ dict: [String: Any]) -> Data {
-    do {
-        return try JSONSerialization.data(withJSONObject: dict)
-    } catch {
-        return #"{"error":"internal serialization error"}"#.data(using: .utf8)!
-    }
-}
-
-func httpResponse(status: Int, statusText: String, body: Data) -> Data {
-    let header = "HTTP/1.1 \(status) \(statusText)\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n"
-    return header.data(using: .utf8)! + body
-}
-
-func jsonResponse(status: Int, statusText: String, _ dict: [String: Any]) -> Data {
-    httpResponse(status: status, statusText: statusText, body: jsonData(dict))
-}
 
 // MARK: - Request Counters
 
-let serverStartDate = Date()
+final class RequestCounters: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "tw.mingtsay.vision-api-server.counters")
+    private var _total: Int = 0
+    private var _success: Int = 0
+    private var _error: Int = 0
+    private var _active: Int = 0
 
-actor RequestCounters {
-    private(set) var totalRequests: Int = 0
-    private(set) var successCount: Int = 0
-    private(set) var errorCount: Int = 0
-    private(set) var activeRequests: Int = 0
+    var total: Int { queue.sync { _total } }
+    var success: Int { queue.sync { _success } }
+    var errorCount: Int { queue.sync { _error } }
+    var active: Int { queue.sync { _active } }
 
-    func beginRequest() { totalRequests += 1; activeRequests += 1 }
-    func endSuccess() { successCount += 1; activeRequests -= 1 }
-    func endError() { errorCount += 1; activeRequests -= 1 }
-
-    func snapshot() -> [String: Int] {
-        [
-            "total_requests": totalRequests,
-            "success_count": successCount,
-            "error_count": errorCount,
-            "active_requests": activeRequests
-        ]
-    }
-}
-
-let counters = RequestCounters()
-
-// MARK: - System Info
-
-func memoryUsageMB() -> Double {
-    var info = mach_task_basic_info()
-    var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size) / 4
-    let result = withUnsafeMutablePointer(to: &info) {
-        $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
-            task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
-        }
-    }
-    guard result == KERN_SUCCESS else { return -1 }
-    return Double(info.resident_size) / (1024 * 1024)
-}
-
-func systemLoadAverage() -> [Double] {
-    var loadavg = [Double](repeating: 0, count: 3)
-    getloadavg(&loadavg, 3)
-    return loadavg
-}
-
-// MARK: - Concurrency Control
-
-/// Limits parallel OCR operations to avoid CPU/memory pressure
-let maxConcurrentOCR = 3
-
-actor OCRLimiter {
-    private var available: Int
-    private var waiters: [CheckedContinuation<Void, Never>] = []
-
-    init(limit: Int) { self.available = limit }
-
-    func acquire() async {
-        if available > 0 {
-            available -= 1
-            return
-        }
-        await withCheckedContinuation { continuation in
-            waiters.append(continuation)
-        }
-    }
-
-    func release() {
-        if let next = waiters.first {
-            waiters.removeFirst()
-            next.resume()
-        } else {
-            available += 1
+    func begin() { queue.sync { _total += 1; _active += 1 } }
+    func end(ok: Bool) {
+        queue.sync {
+            _active -= 1
+            if ok { _success += 1 } else { _error += 1 }
         }
     }
 }
 
-let ocrLimiter = OCRLimiter(limit: maxConcurrentOCR)
+// MARK: - OCR Limiter
 
-func withOCRSlot<T>(_ work: () async throws -> T) async throws -> T {
-    await ocrLimiter.acquire()
-    do {
-        let result = try await work()
-        await ocrLimiter.release()
-        return result
-    } catch {
-        await ocrLimiter.release()
-        throw error
+final class OCRLimiter: @unchecked Sendable {
+    private let sem: DispatchSemaphore
+
+    init(maxConcurrent: Int = 4) {
+        sem = DispatchSemaphore(value: maxConcurrent)
     }
+
+    func acquire(timeout: TimeInterval = 30) -> Bool {
+        sem.wait(timeout: .now() + timeout) == .success
+    }
+
+    func release() { sem.signal() }
+}
+
+// MARK: - OCR Engine
+
+struct OCRObservation {
+    let text: String
+    let confidence: Float
+    let x: Double
+    let y: Double
+    let width: Double
+    let height: Double
+}
+
+struct OCRResult {
+    let text: String
+    let lines: [String]
+    let paragraphCount: Int
+    let confidence: Float
+    let observations: [OCRObservation]?
+}
+
+func performOCR(imageData: Data, languages: [String]?, includeBoxes: Bool) -> OCRResult {
+    guard let src = CGImageSourceCreateWithData(imageData as CFData, nil),
+          let cgImage = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
+        return OCRResult(text: "", lines: [], paragraphCount: 0, confidence: 0,
+                         observations: includeBoxes ? [] : nil)
+    }
+
+    let request = VNRecognizeTextRequest()
+    request.recognitionLevel = .accurate
+    request.usesLanguageCorrection = true
+    if let langs = languages, !langs.isEmpty {
+        request.recognitionLanguages = langs
+    } else {
+        request.recognitionLanguages = ["zh-Hant-TW", "ja-JP", "en-US", "zh-Hant-HK", "zh-Hans-CN"]
+    }
+
+    let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+    do { try handler.perform([request]) } catch { /* fall through to empty results */ }
+
+    guard let results = request.results, !results.isEmpty else {
+        return OCRResult(text: "", lines: [], paragraphCount: 0, confidence: 0,
+                         observations: includeBoxes ? [] : nil)
+    }
+
+    // Sort top-to-bottom (descending normalised Y), then left-to-right
+    let sorted = results.sorted { a, b in
+        let ay = a.boundingBox.origin.y + a.boundingBox.height
+        let by = b.boundingBox.origin.y + b.boundingBox.height
+        if abs(ay - by) > 0.01 { return ay > by }
+        return a.boundingBox.origin.x < b.boundingBox.origin.x
+    }
+
+    var lines: [String] = []
+    var totalConf: Float = 0
+    var obs: [OCRObservation] = []
+
+    for r in sorted {
+        guard let c = r.topCandidates(1).first else { continue }
+        lines.append(c.string)
+        totalConf += c.confidence
+        if includeBoxes {
+            let b = r.boundingBox
+            obs.append(OCRObservation(
+                text: c.string, confidence: c.confidence,
+                x: b.origin.x, y: b.origin.y,
+                width: b.size.width, height: b.size.height))
+        }
+    }
+
+    let avgConf = Float(totalConf) / Float(sorted.count)
+
+    // Paragraph detection: a vertical gap > 1.5× line height starts a new paragraph
+    var paraCount = lines.isEmpty ? 0 : 1
+    if sorted.count > 1 {
+        for i in 1..<sorted.count {
+            let prevBottom = sorted[i - 1].boundingBox.origin.y
+            let currTop = sorted[i].boundingBox.origin.y + sorted[i].boundingBox.height
+            let gap = prevBottom - currTop
+            let lh = sorted[i].boundingBox.height
+            if lh > 0 && gap > lh * 1.5 { paraCount += 1 }
+        }
+    }
+
+    return OCRResult(
+        text: lines.joined(separator: "\n"),
+        lines: lines,
+        paragraphCount: paraCount,
+        confidence: avgConf,
+        observations: includeBoxes ? obs : nil)
 }
 
 // MARK: - Image Validation
 
-let pngSignature = Data([0x89, 0x50, 0x4E, 0x47])
-let jpegSignature = Data([0xFF, 0xD8, 0xFF])
-let heicSignatures: [Data] = [
-    Data("ftypheic".utf8),
-    Data("ftypheix".utf8),
-    Data("ftypmif1".utf8)
-]
-
 func isValidImageData(_ data: Data) -> Bool {
-    if data.count < 12 { return false }
-    if data.prefix(4) == pngSignature { return true }
-    if data.prefix(3) == jpegSignature { return true }
-    // HEIC: ftyp box starts at byte 4
-    let ftypSlice = data[4..<min(12, data.count)]
-    for sig in heicSignatures {
-        if ftypSlice.starts(with: sig) { return true }
-    }
+    guard data.count >= 4 else { return false }
+    let bytes = [UInt8](data.prefix(12))
+    // PNG: 89 50 4E 47
+    if bytes[0] == 0x89 && bytes[1] == 0x50 && bytes[2] == 0x4E && bytes[3] == 0x47 { return true }
+    // JPEG: FF D8 FF
+    if bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF { return true }
+    // HEIC: offset 4 = "ftyp"
+    if data.count >= 12 && bytes[4] == 0x66 && bytes[5] == 0x74 && bytes[6] == 0x79 && bytes[7] == 0x70 { return true }
     return false
 }
 
-// MARK: - Vision OCR
+// MARK: - JSON Helpers
 
-func makeTextRequest() -> RecognizeTextRequest {
-    var request = RecognizeTextRequest()
-    request.recognitionLevel = .accurate
-    request.usesLanguageCorrection = true
-    request.recognitionLanguages = [
-        Locale.Language(identifier: "zh-Hant"),
-        Locale.Language(identifier: "zh-Hans"),
-        Locale.Language(identifier: "en-US")
+func jsonData(_ obj: Any) -> Data {
+    (try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])) ?? Data("{}".utf8)
+}
+
+// MARK: - HTTP Response
+
+struct HTTPResponse {
+    let status: Int
+    let body: Data
+    let contentType: String
+
+    static func json(_ obj: Any, status: Int = 200) -> HTTPResponse {
+        HTTPResponse(status: status, body: jsonData(obj),
+                     contentType: "application/json; charset=utf-8")
+    }
+
+    static func error(_ msg: String, status: Int = 400) -> HTTPResponse {
+        json(["error": msg], status: status)
+    }
+
+    func serialized() -> Data {
+        let reason: String
+        switch status {
+        case 200: reason = "OK"
+        case 400: reason = "Bad Request"
+        case 404: reason = "Not Found"
+        case 429: reason = "Too Many Requests"
+        case 500: reason = "Internal Server Error"
+        default:  reason = "Error"
+        }
+        var head = "HTTP/1.1 \(status) \(reason)\r\n"
+        head += "Content-Type: \(contentType)\r\n"
+        head += "Content-Length: \(body.count)\r\n"
+        head += "Connection: close\r\n"
+        head += "\r\n"
+        var d = Data(head.utf8)
+        d.append(body)
+        return d
+    }
+}
+
+// MARK: - HTTP Request Parser
+
+struct HTTPRequest {
+    let method: String
+    let path: String
+    let headers: [String: String]
+    let body: Data
+}
+
+func parseHTTP(_ data: Data) -> HTTPRequest? {
+    guard let sep = data.range(of: Data("\r\n\r\n".utf8)) else { return nil }
+    guard let hdr = String(data: data[data.startIndex..<sep.lowerBound], encoding: .utf8) else { return nil }
+    let lines = hdr.split(separator: "\r\n", maxSplits: 500, omittingEmptySubsequences: false)
+    guard let first = lines.first else { return nil }
+    let parts = first.split(separator: " ", maxSplits: 2)
+    guard parts.count >= 2 else { return nil }
+
+    var headers: [String: String] = [:]
+    for i in 1..<lines.count {
+        guard let colon = lines[i].firstIndex(of: ":") else { continue }
+        let k = String(lines[i][lines[i].startIndex..<colon]).lowercased()
+        let v = String(lines[i][lines[i].index(after: colon)...]).trimmingCharacters(in: .whitespaces)
+        headers[k] = v
+    }
+
+    return HTTPRequest(method: String(parts[0]), path: String(parts[1]),
+                       headers: headers, body: Data(data[sep.upperBound...]))
+}
+
+// MARK: - Router
+
+let counters = RequestCounters()
+let limiter = OCRLimiter(maxConcurrent: 3)
+let startTime = Date()
+
+func route(_ req: HTTPRequest) -> HTTPResponse {
+    switch (req.method, req.path) {
+    case ("GET", "/health"):
+        return health()
+    case ("POST", "/recognize"):
+        return recognize(req)
+    case ("POST", "/recognize/raw"):
+        return recognizeRaw(req)
+    default:
+        return HTTPResponse.error(
+            "VisionApiServer v\(kVersion)\n" +
+            "  GET  /health            Health check\n" +
+            "  POST /recognize         JSON body: {\"path\": \"/file\"} or {\"base64\": \"...\"}\n" +
+            "  POST /recognize/raw     Raw image bytes as body",
+            status: 404)
+    }
+}
+
+func health() -> HTTPResponse {
+    let uptime = Int(Date().timeIntervalSince(startTime))
+
+    var loadavg = [Double](repeating: 0, count: 3)
+    getloadavg(&loadavg, 3)
+
+    // Resident memory via task_info
+    var memMB = 0.0
+    var info = mach_task_basic_info()
+    var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size / MemoryLayout<natural_t>.size)
+    let kr = withUnsafeMutablePointer(to: &info) { ptr in
+        ptr.withMemoryRebound(to: Int32.self, capacity: Int(count)) { reboundPtr in
+            task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), reboundPtr, &count)
+        }
+    }
+    if kr == KERN_SUCCESS { memMB = Double(info.resident_size) / 1_048_576.0 }
+
+    return .json([
+        "status": "ok",
+        "version": kVersion,
+        "build_number": kBuildNumber,
+        "build_date": kBuildDate,
+        "uptime_seconds": uptime,
+        "memory_mb": (memMB * 10).rounded() / 10,
+        "supported_formats": ["heic", "jpeg", "jpg", "png"],
+        "load_average": ["1m": loadavg[0], "5m": loadavg[1], "15m": loadavg[2]],
+        "counters": [
+            "total_requests": counters.total,
+            "success_count": counters.success,
+            "error_count": counters.errorCount,
+            "active_requests": counters.active,
+        ],
+    ] as [String: Any])
+}
+
+func recognize(_ req: HTTPRequest) -> HTTPResponse {
+    guard !req.body.isEmpty else {
+        return .error("invalid request body, expected JSON with 'path' or 'base64' field")
+    }
+    guard let json = try? JSONSerialization.jsonObject(with: req.body) as? [String: Any] else {
+        return .error("invalid request body, expected JSON with 'path' or 'base64' field")
+    }
+
+    let langs = json["languages"] as? [String]
+    let includeBoxes = json["include_boxes"] as? Bool ?? false
+
+    let imageData: Data
+    if let path = json["path"] as? String {
+        guard let d = FileManager.default.contents(atPath: path) else {
+            return .error("file not found: \(path)", status: 404)
+        }
+        imageData = d
+    } else if let b64 = json["base64"] as? String {
+        guard let d = Data(base64Encoded: b64) else {
+            return .error("invalid base64 data")
+        }
+        imageData = d
+    } else {
+        return .error("expected 'path' or 'base64' field")
+    }
+
+    return doOCR(imageData, langs: langs, includeBoxes: includeBoxes)
+}
+
+func recognizeRaw(_ req: HTTPRequest) -> HTTPResponse {
+    guard !req.body.isEmpty else {
+        return .error("incomplete request body")
+    }
+    return doOCR(req.body, langs: nil, includeBoxes: false)
+}
+
+func doOCR(_ imageData: Data, langs: [String]?, includeBoxes: Bool) -> HTTPResponse {
+    guard isValidImageData(imageData) else {
+        return .error("unsupported image format (expected PNG, JPEG, or HEIC)", status: 422)
+    }
+    counters.begin()
+    guard limiter.acquire() else {
+        counters.end(ok: false)
+        return .error("too many concurrent requests, try again later", status: 429)
+    }
+    defer { limiter.release() }
+
+    let r = performOCR(imageData: imageData, languages: langs, includeBoxes: includeBoxes)
+    counters.end(ok: true)
+
+    var dict: [String: Any] = [
+        "text": r.text,
+        "lines": r.lines,
+        "line_count": r.lines.count,
+        "paragraph_count": r.paragraphCount,
+        "confidence": r.confidence,
+        "sufficient": r.confidence > 0.85 && !r.lines.isEmpty,
     ]
-    return request
+
+    if let obs = r.observations {
+        dict["observations"] = obs.map { o -> [String: Any] in
+            [
+                "text": o.text,
+                "confidence": o.confidence,
+                "bounding_box": [
+                    "x": (o.x * 10000).rounded() / 10000,
+                    "y": (o.y * 10000).rounded() / 10000,
+                    "width": (o.width * 10000).rounded() / 10000,
+                    "height": (o.height * 10000).rounded() / 10000,
+                ],
+            ]
+        }
+    }
+
+    return .json(dict)
 }
 
-func buildResult(from observations: [RecognizedTextObservation]) -> [String: Any] {
-    var lines: [String] = []
-    var totalConfidence: Float = 0
-    var candidateCount = 0
+// MARK: - TCP Server
 
-    // Use bounding box Y gaps to detect paragraph breaks.
-    // Vision's coordinate origin is at the bottom-left; observations are ordered top-to-bottom,
-    // so each successive line has a *smaller* Y value. We compare the previous line's minY
-    // (its bottom edge) against the current line's maxY (its top edge).
-    var paragraphCount = 0
-    var lastMinY: CGFloat = -1
-    let gapThreshold: CGFloat = 0.02 // normalized coordinate threshold
-
-    for observation in observations {
-        let candidates = observation.topCandidates(1)
-        if let top = candidates.first {
-            lines.append(top.string)
-            totalConfidence += top.confidence
-            candidateCount += 1
-        }
-
-        let box = observation.boundingBox.cgRect
-        if lastMinY < 0 {
-            paragraphCount = 1
-        } else if (lastMinY - box.maxY) > gapThreshold {
-            paragraphCount += 1
-        }
-        lastMinY = box.minY
-    }
-
-    let fullText = lines.joined(separator: "\n")
-    let avgConfidence = candidateCount > 0 ? totalConfidence / Float(candidateCount) : 0
-    let confidence = Double((avgConfidence * 10000).rounded() / 10000)
-    let sufficient = confidence > 0.85 && !lines.isEmpty
-
-    return [
-        "text": fullText,
-        "lines": lines,
-        "confidence": confidence,
-        "paragraph_count": paragraphCount,
-        "line_count": lines.count,
-        "sufficient": sufficient
-    ]
-}
-
-func recognizeText(from imageData: Data) async throws -> [String: Any] {
-    try await withOCRSlot {
-        let request = makeTextRequest()
-        let observations = try await request.perform(on: imageData)
-        return buildResult(from: observations)
-    }
-}
-
-func recognizeText(at path: String) async throws -> [String: Any] {
-    let url = URL(fileURLWithPath: path)
-
-    guard FileManager.default.fileExists(atPath: path) else {
-        return ["_status": 404, "_statusText": "Not Found", "error": "file not found"]
-    }
-
-    let ext = url.pathExtension.lowercased()
-    guard supportedExtensions.contains(ext) else {
-        return ["_status": 422, "_statusText": "Unprocessable Entity", "error": "unsupported format"]
-    }
-
-    // Use perform(on: URL) to let Vision handle memory mapping internally
-    return try await withOCRSlot {
-        let request = makeTextRequest()
-        let observations = try await request.perform(on: url)
-        return buildResult(from: observations)
-    }
-}
-
-// MARK: - Request Handling
-
-let headerBodySeparator = Data("\r\n\r\n".utf8)
-
-func parseHTTPRequest(_ data: Data) -> (method: String, path: String, body: Data?) {
-    // Find the header/body boundary by searching in raw Data to preserve binary body
-    guard let separatorRange = data.range(of: headerBodySeparator) else {
-        return ("", "", nil)
-    }
-
-    let headerData = data[data.startIndex..<separatorRange.lowerBound]
-    guard let headerSection = String(data: headerData, encoding: .utf8) else {
-        return ("", "", nil)
-    }
-
-    let bodyData: Data? = separatorRange.upperBound < data.endIndex
-        ? data[separatorRange.upperBound...]
-        : nil
-
-    let firstLine = headerSection.components(separatedBy: "\r\n").first ?? ""
-    let tokens = firstLine.split(separator: " ")
-    guard tokens.count >= 2 else { return ("", "", nil) }
-
-    return (String(tokens[0]), String(tokens[1]), bodyData)
-}
-
-func handleRequest(_ data: Data) async -> Data {
-    let (method, path, body) = parseHTTPRequest(data)
-
-    if method == "GET" && path == "/health" {
-        let uptime = Date().timeIntervalSince(serverStartDate)
-        let load = systemLoadAverage()
-        let stats = await counters.snapshot()
-        let health: [String: Any] = [
-            "status": "ok",
-            "version": buildVersion,
-            "build_number": buildNumber,
-            "build_date": buildDate,
-            "uptime_seconds": Int(uptime),
-            "memory_mb": Double(round(memoryUsageMB() * 100) / 100),
-            "load_average": ["1m": load[0], "5m": load[1], "15m": load[2]],
-            "supported_formats": supportedExtensions.sorted(),
-            "counters": stats
-        ]
-        return jsonResponse(status: 200, statusText: "OK", health)
-    }
-
-    if method == "POST" && path == "/recognize" {
-        guard let body = body,
-              let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else {
-            return jsonResponse(status: 400, statusText: "Bad Request", ["error": "invalid request body, expected JSON with 'path' or 'base64' field"])
-        }
-
-        await counters.beginRequest()
-        do {
-            let result: [String: Any]
-
-            if let filePath = json["path"] as? String {
-                result = try await recognizeText(at: filePath)
-            } else if let base64String = json["base64"] as? String {
-                guard let imageData = Data(base64Encoded: base64String) else {
-                    await counters.endError()
-                    return jsonResponse(status: 400, statusText: "Bad Request", ["error": "invalid base64 data"])
-                }
-                guard isValidImageData(imageData) else {
-                    await counters.endError()
-                    return jsonResponse(status: 422, statusText: "Unprocessable Entity", ["error": "unsupported format"])
-                }
-                result = try await recognizeText(from: imageData)
-            } else {
-                await counters.endError()
-                return jsonResponse(status: 400, statusText: "Bad Request", ["error": "expected 'path' or 'base64' field"])
-            }
-
-            if let status = result["_status"] as? Int,
-               let statusText = result["_statusText"] as? String {
-                var errorResult = result
-                errorResult.removeValue(forKey: "_status")
-                errorResult.removeValue(forKey: "_statusText")
-                await counters.endError()
-                return jsonResponse(status: status, statusText: statusText, errorResult)
-            }
-            await counters.endSuccess()
-            return jsonResponse(status: 200, statusText: "OK", result)
-        } catch {
-            await counters.endError()
-            return jsonResponse(status: 500, statusText: "Internal Server Error", ["error": error.localizedDescription])
-        }
-    }
-
-    if method == "POST" && path == "/recognize/raw" {
-        guard let body = body, !body.isEmpty else {
-            return jsonResponse(status: 400, statusText: "Bad Request", ["error": "empty body, expected raw image data"])
-        }
-
-        let imageData = Data(body)
-        guard isValidImageData(imageData) else {
-            return jsonResponse(status: 422, statusText: "Unprocessable Entity", ["error": "unsupported format"])
-        }
-
-        await counters.beginRequest()
-        do {
-            let result = try await recognizeText(from: imageData)
-            await counters.endSuccess()
-            return jsonResponse(status: 200, statusText: "OK", result)
-        } catch {
-            await counters.endError()
-            return jsonResponse(status: 500, statusText: "Internal Server Error", ["error": error.localizedDescription])
-        }
-    }
-
-    return jsonResponse(status: 404, statusText: "Not Found", ["error": "not found"])
-}
-
-// MARK: - TCP Server with Network.framework
-
-let listener: NWListener
-do {
+func startServer(host: String, port: UInt16) {
     let params = NWParameters.tcp
-    listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!)
-} catch {
-    fatalError("Failed to create listener: \(error)")
+    params.allowLocalEndpointReuse = true
+
+    guard let nwPort = NWEndpoint.Port(rawValue: port) else {
+        fputs("Invalid port: \(port)\n", stderr)
+        exit(1)
+    }
+
+    let listener: NWListener
+    do { listener = try NWListener(using: params, on: nwPort) }
+    catch { fputs("Failed to create listener: \(error)\n", stderr); exit(1) }
+
+    listener.newConnectionHandler = { conn in
+        conn.start(queue: .global(qos: .userInitiated))
+        handleConnection(conn)
+    }
+
+    listener.stateUpdateHandler = { state in
+        switch state {
+        case .ready:
+            print("VisionApiServer v\(kVersion) listening on \(host):\(port)")
+        case .failed(let err):
+            fputs("Listener failed: \(err)\n", stderr)
+            exit(1)
+        default: break
+        }
+    }
+
+    listener.start(queue: .main)
+    signal(SIGTERM, SIG_IGN)
+    let termSrc = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+    termSrc.setEventHandler {
+        print("SIGTERM received, shutting down…")
+        listener.cancel()
+        exit(0)
+    }
+    termSrc.resume()
+    dispatchMain()
 }
 
-func sendResponse(_ response: Data, on connection: NWConnection) {
-    connection.send(content: response, completion: .contentProcessed { _ in
-        connection.cancel()
+func handleConnection(_ conn: NWConnection) {
+    var buf = Data()
+
+    func recv() {
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 1_048_576) { data, _, isComplete, error in
+            if let d = data { buf.append(d) }
+
+            if let sep = buf.range(of: Data("\r\n\r\n".utf8)) {
+                let headerData = buf[buf.startIndex..<sep.lowerBound]
+                var contentLength = 0
+                if let hdr = String(data: headerData, encoding: .utf8) {
+                    for line in hdr.split(separator: "\r\n") {
+                        let lower = line.lowercased()
+                        if lower.hasPrefix("content-length:") {
+                            contentLength = Int(lower.split(separator: ":").last?
+                                .trimmingCharacters(in: .whitespaces) ?? "0") ?? 0
+                        }
+                    }
+                }
+                let bodyStart = sep.upperBound
+                let bodyLen = buf.distance(from: bodyStart, to: buf.endIndex)
+                if bodyLen >= contentLength {
+                    respond(conn, buf)
+                    return
+                }
+            }
+
+            // 8 MB safety limit
+            if buf.count > 8_388_608 {
+                let r = HTTPResponse.error("request too large", status: 413).serialized()
+                conn.send(content: r, completion: .contentProcessed { _ in conn.cancel() })
+                return
+            }
+
+            if isComplete || error != nil {
+                if !buf.isEmpty { respond(conn, buf) } else { conn.cancel() }
+                return
+            }
+
+            recv()
+        }
+    }
+
+    recv()
+}
+
+func respond(_ conn: NWConnection, _ data: Data) {
+    let resp: HTTPResponse
+    if let req = parseHTTP(data) {
+        resp = route(req)
+    } else {
+        resp = .error("malformed HTTP request")
+    }
+    conn.send(content: resp.serialized(), completion: .contentProcessed { _ in
+        conn.cancel()
     })
 }
 
-func receiveFullRequest(on connection: NWConnection, accumulated: Data = Data()) {
-    connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, isComplete, error in
-        guard let data = data, error == nil else {
-            connection.cancel()
-            return
-        }
+// MARK: - Entry Point
 
-        let buffer = accumulated + data
+var host = "::"
+var port: UInt16 = 8765
 
-        // Check if we have the full HTTP request by searching for header/body boundary in raw Data
-        if let separatorRange = buffer.range(of: headerBodySeparator) {
-            let headerData = buffer[buffer.startIndex..<separatorRange.lowerBound]
-            let bodyStart = separatorRange.upperBound
-
-            // Parse Content-Length from headers
-            var contentLength = 0
-            if let headerStr = String(data: headerData, encoding: .utf8) {
-                for line in headerStr.split(separator: "\r\n") {
-                    if line.lowercased().hasPrefix("content-length:") {
-                        let value = line.dropFirst("content-length:".count).trimmingCharacters(in: .whitespaces)
-                        contentLength = Int(value) ?? 0
-                    }
-                }
-            }
-
-            let bodyReceived = buffer.count - bodyStart
-            if bodyReceived >= contentLength {
-                Task {
-                    guard !Task.isCancelled else { connection.cancel(); return }
-                    let response = await handleRequest(buffer)
-                    sendResponse(response, on: connection)
-                }
-                return
-            }
-        }
-
-        if isComplete {
-            // Connection closed before full body received — likely client disconnect
-            Task {
-                guard !Task.isCancelled else { connection.cancel(); return }
-                let response = jsonResponse(status: 400, statusText: "Bad Request",
-                                            ["error": "incomplete request body"])
-                sendResponse(response, on: connection)
-            }
-        } else {
-            receiveFullRequest(on: connection, accumulated: buffer)
-        }
+var argv = Array(CommandLine.arguments.dropFirst())
+var idx = 0
+while idx < argv.count {
+    switch argv[idx] {
+    case "--host":
+        idx += 1; if idx < argv.count { host = argv[idx] }
+    case "--port":
+        idx += 1; if idx < argv.count { port = UInt16(argv[idx]) ?? 8765 }
+    case "--help", "-h":
+        print("Usage: vision-api-server [--host HOST] [--port PORT]")
+        print("  Default: --host :: --port 8765")
+        exit(0)
+    default: break
     }
+    idx += 1
 }
 
-let requestTimeout: TimeInterval = 30
-
-listener.newConnectionHandler = { connection in
-    connection.start(queue: .global())
-
-    // Timeout: cancel connection if request takes too long
-    let deadline = DispatchTime.now() + requestTimeout
-    DispatchQueue.global().asyncAfter(deadline: deadline) { [weak connection] in
-        if let c = connection, c.state != .cancelled {
-            c.cancel()
-        }
-    }
-
-    receiveFullRequest(on: connection)
-}
-
-listener.stateUpdateHandler = { state in
-    switch state {
-    case .ready:
-        print("Vision OCR API Server listening on \(formatListenAddress(host: host, port: port))")
-    case .failed(let error):
-        fatalError("Listener failed: \(error)")
-    default:
-        break
-    }
-}
-
-listener.start(queue: .main)
-RunLoop.main.run()
+startServer(host: host, port: port)

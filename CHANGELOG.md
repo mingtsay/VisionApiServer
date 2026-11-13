@@ -5,6 +5,29 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] - 2026-11-13
+
+### Added
+- **Bounding box support**: `POST /recognize` accepts `"include_boxes": true` in the
+  request body. When enabled, the response includes an `observations` array with each
+  recognized text line, its confidence, and its normalized bounding box (origin at
+  bottom-left, values 0–1).
+- Image format validation via magic-byte sniffing (PNG, JPEG, HEIC). Unsupported
+  formats now return HTTP 422 instead of an empty OCR result.
+- Graceful SIGTERM handling.
+
+### Changed
+- Default recognition languages changed to: zh-Hant-TW, ja-JP, en-US, zh-Hant-HK,
+  zh-Hans-CN (was zh-Hant, zh-Hans, en-US). Clients can still override via the
+  `languages` field in the request body.
+- `sufficient` threshold aligned with v1 documentation: `confidence > 0.85`
+  (was >= 0.5 in initial v2 development).
+- Max concurrent OCR operations: 3 (aligned with v1).
+- Rewritten from scratch for `swiftc` command-line builds (no Xcode required).
+  Uses `VNRecognizeTextRequest` (available since macOS 10.15) and
+  `DispatchQueue`-based concurrency instead of macOS 15 `RecognizeTextRequest`
+  and Swift actors. The `build.sh` / xcodebuild path still works.
+
 ## [1.0.1] - 2026-04-14
 
 ### Fixed
@@ -36,3 +59,4 @@ Initial release.
 
 [1.0.1]: https://github.com/mingtsay/VisionApiServer/releases/tag/v1.0.1
 [1.0.0]: https://github.com/mingtsay/VisionApiServer/releases/tag/v1.0.0
+[2.0.0]: https://github.com/mingtsay/VisionApiServer/releases/tag/v2.0.0

@@ -129,6 +129,42 @@ All recognize endpoints return:
 
 `sufficient` is `true` when `confidence > 0.85` and at least one line was recognized. Paragraphs are detected from vertical gaps between text bounding boxes.
 
+### Bounding boxes (v2.0+)
+
+To include bounding boxes for each recognized text observation, add `"include_boxes": true` to the request body:
+
+```sh
+curl -s http://localhost:8765/recognize \
+  -H 'Content-Type: application/json' \
+  -d '{"path": "/path/to/image.png", "include_boxes": true}'
+```
+
+The response gains an `observations` array:
+
+```json
+{
+  "text": "...",
+  "lines": ["..."],
+  "line_count": 2,
+  "confidence": 0.95,
+  "sufficient": true,
+  "observations": [
+    {
+      "text": "line 1",
+      "confidence": 0.98,
+      "bounding_box": {
+        "x": 0.1,
+        "y": 0.85,
+        "width": 0.8,
+        "height": 0.03
+      }
+    }
+  ]
+}
+```
+
+Coordinates are normalized (0–1), origin at the bottom-left corner of the image. `x`/`y` is the bottom-left of the bounding box, `width`/`height` extend rightward and upward. Without `"include_boxes": true` the response is unchanged from v1.
+
 ### Error responses
 
 | Status | When |
@@ -146,7 +182,7 @@ PNG, JPEG, HEIC. Format is detected by magic bytes on uploaded data, not just by
 
 - Recognition level: `.accurate`
 - Language correction: on
-- Languages: Traditional Chinese, Simplified Chinese, English (in that priority order)
+- Languages: Traditional Chinese (TW), Japanese, English, Traditional Chinese (HK), Simplified Chinese (in that priority order). Clients can override via the `languages` field.
 
 Edit `makeTextRequest()` in `VisionApiServer/main.swift` to change these.
 
